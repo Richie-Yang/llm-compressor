@@ -3,7 +3,7 @@
 Docker image for [`llmcompressor`](https://github.com/vllm-project/llm-compressor) on the GB10 (aarch64, Blackwell) host.
 
 - Base: `nvcr.io/nvidia/pytorch:26.04-py3` (NGC's GPU-tuned `torch` is kept; pip is constrained so it cannot be replaced)
-- `llmcompressor` version is pinned (default `0.13.0`), `transformers` upgrades to whatever that release needs
+- `llmcompressor` version is pinned (default `0.13.0`), `transformers` is pinned to `5.14.1` (the newest that `llmcompressor 0.13.0` allows). Bumping `LLMCOMPRESSOR_VERSION` may require changing this pin in the `Dockerfile`
 
 ## Build
 
