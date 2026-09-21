@@ -1,5 +1,6 @@
 """Shared helpers for the quantize_*.py scripts (run inside the llm-compressor image)."""
 import argparse
+import os
 from pathlib import Path
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -37,8 +38,21 @@ def calibration_kwargs(args):
     )
 
 
+def _open_permissions(path):
+    """chmod 777 path and everything below it (the container writes as root)."""
+    os.chmod(path, 0o777)
+    for root, dirs, files in os.walk(path):
+        for name in dirs + files:
+            os.chmod(os.path.join(root, name), 0o777)
+
+
 def save(model, tokenizer, args, suffix):
-    out = Path(args.output_dir) / f"{Path(args.model_id).name}-{suffix}"
+    parent = Path(args.output_dir)
+    parent_is_new = not parent.exists()
+    out = parent / f"{Path(args.model_id).name}-{suffix}"
     model.save_pretrained(out, save_compressed=True)
     tokenizer.save_pretrained(out)
+    if parent_is_new:  # so model folders under it can be deleted without root
+        os.chmod(parent, 0o777)
+    _open_permissions(out)
     print(f"saved {out}")

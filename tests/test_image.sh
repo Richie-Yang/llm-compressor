@@ -97,6 +97,9 @@ check_quantize_script() {
   if [ ! -f "$cfg" ]; then echo "missing $cfg"; rc=1
   elif ! grep -q '"quant_method": "compressed-tensors"' "$cfg"; then echo "no compressed-tensors quantization_config in $cfg"; rc=1
   elif ! grep -q "\"format\": \"$fmt\"" "$cfg"; then echo "expected quantization format '$fmt' in $cfg"; rc=1
+  elif [ -n "$(find "$out/${model##*/}-$suffix" -not -perm 0777)" ]; then
+    echo "expected every file/dir in the output to be mode 777, found:"
+    find "$out/${model##*/}-$suffix" -not -perm 0777 -printf '%m %p\n' | head -5; rc=1
   fi
   # Container wrote as root; remove from inside a container.
   docker run --rm --runtime=runc -v "$out:/t" --entrypoint sh "$image" -c 'rm -rf /t/* /t/.[!.]*' >/dev/null 2>&1

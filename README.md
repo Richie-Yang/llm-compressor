@@ -54,6 +54,34 @@ Common flags: `--output-dir`, `--ignore` (modules to skip, default `lm_head`). C
 `--max-seq-len` (2048). MoE and vision-language models need a longer `--ignore` list or a different model
 class, so these scripts are not a drop-in for them.
 
+### Choosing a scheme
+
+Sizes are relative to the BF16 original. Speed and accuracy depend on the model, the inference engine
+(e.g. vLLM) and its kernels for your GPU, so evaluate the result on your own task before switching.
+
+**FP8 Dynamic** (`quantize_fp8_dynamic.py`), about 2x smaller
+- Pros: no calibration data; quantizes in minutes; usually the smallest accuracy loss; activation scales are computed at runtime, so there is nothing to tune
+- Cons: only about 2x compression; real compute speedup needs FP8 hardware (Ada, Hopper, Blackwell); dynamic scaling adds a little runtime overhead
+
+**INT8 W8A8** (`quantize_w8a8_int8.py`), about 2x smaller
+- Pros: INT8 tensor cores exist on more GPUs (Ampere and later), so it is the 8-bit option where FP8 is unavailable; quantized weights and activations speed up compute-bound work such as large batches and prefill
+- Cons: needs calibration data; SmoothQuant + GPTQ makes it slower to quantize than FP8; activation outliers make it more accuracy-sensitive; SmoothQuant needs layer mappings, which may not exist for unusual architectures; on FP8-capable GPUs, FP8 is generally the simpler choice
+
+**W4A16 GPTQ** (`quantize_w4a16_gptq.py`), about 3.5-4x smaller
+- Pros: biggest memory saving of the weight-only options, so larger models fit and low-batch decoding (memory-bound) gets faster; GPTQ's error compensation keeps 4-bit accuracy good
+- Cons: activations stay 16-bit, so there is no compute speedup, and large batches or prefill can be slower than BF16; needs calibration data and the result depends on its quality (it can overfit the calibration set); slowest and most memory-hungry to quantize; larger accuracy loss than 8-bit, especially on small models
+
+**W4A16 AWQ** (`quantize_w4a16_awq.py`), about 3.5-4x smaller
+- Pros: same size and runtime characteristics as GPTQ; protects the channels that matter most to activations and tends to overfit the calibration set less; often quicker to quantize
+- Cons: same weight-only limits as GPTQ (no compute speedup, needs calibration data); AWQ needs layer mappings, which may not exist for unusual architectures; accuracy versus GPTQ varies by model, so try both if it matters
+
+**NVFP4** (`quantize_nvfp4.py`), about 3.5-4x smaller
+- Pros: Blackwell-native 4-bit float for both weights and activations, so it can cut memory and speed up compute on the GB10; per-block scales keep accuracy better than plain 4-bit integer activations
+- Cons: needs Blackwell, and your inference engine must ship FP4 kernels for that GPU; needs calibration data for activation scales; 4-bit activations lose more accuracy than the 8-bit schemes, especially on small models; newest and least mature of the formats
+
+Rule of thumb: start with FP8 Dynamic. Go to W4A16 when memory is the limit, and to NVFP4 when you need 4-bit
+speed on Blackwell and your engine supports it.
+
 ## Mounts
 
 | Host (override with)                                 | Container                  | Purpose                        |
@@ -61,7 +89,9 @@ class, so these scripts are not a drop-in for them.
 | `~/.cache/huggingface` (`HF_CACHE_DIR`)              | `/root/.cache/huggingface` | reuse downloaded models        |
 | `./models` (`MODELS_DIR`)                            | `/models`                  | scripts and compressed outputs |
 
-Docker creates a missing `./models` as root-owned; files written from the container are root-owned too.
+Docker creates a missing `./models` as root-owned. Files written by the container are root-owned too, but the
+quantize scripts `chmod 777` each saved model folder (and `output/` if they created it), so anyone can read,
+modify and delete them.
 
 ## Tests
 
