@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Host-side tests for the llm-compressor image.
+# Usage: tests/test_image.sh [test_name ...]   (default: run every test)
+set -uo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE=(docker compose -f "$DIR/docker-compose.yml")
+FAILED=0
+
+SKIP_RC=77
+
+run() {
+  local name=$1 rc
+  echo "=== $name"
+  "$name"; rc=$?
+  case $rc in
+    0) echo "PASS $name" ;;
+    $SKIP_RC) echo "SKIP $name" ;;
+    *) echo "FAIL $name"; FAILED=1 ;;
+  esac
+}
+
+test_compose_config() {
+  local cfg
+  cfg=$("${COMPOSE[@]}" config 2>&1) || { echo "$cfg"; return 1; }
+  grep -q 'llm-compressor:' <<<"$cfg" || { echo "service llm-compressor missing"; return 1; }
+  grep -q 'driver: nvidia' <<<"$cfg" || { echo "nvidia GPU reservation missing"; return 1; }
+  grep -q 'target: /root/.cache/huggingface' <<<"$cfg" || { echo "HF cache mount missing"; return 1; }
+  grep -q 'target: /models' <<<"$cfg" || { echo "/models mount missing"; return 1; }
+}
+
+test_image_builds() {
+  local log rc
+  log=$(mktemp)
+  "${COMPOSE[@]}" build >"$log" 2>&1; rc=$?
+  tail -n 15 "$log"; rm -f "$log"
+  return $rc
+}
+
+test_smoke_prints_version() {
+  local out rc
+  out=$("${COMPOSE[@]}" run --rm llm-compressor 2>&1); rc=$?
+  echo "$out" | tail -n 15
+  [ $rc -eq 0 ] || { echo "smoke test exited $rc"; return 1; }
+  grep -q '^llmcompressor 0.13.0$' <<<"$out" || { echo "expected 'llmcompressor 0.13.0'"; return 1; }
+}
+
+test_torch_is_ngc_build() {
+  local out
+  out=$("${COMPOSE[@]}" run --rm llm-compressor 2>&1) || { echo "$out" | tail -n 15; return 1; }
+  grep -E -q '^torch [0-9][^ ]*\.nv[0-9]' <<<"$out" \
+    || { echo "$out" | tail -n 5; echo "expected 'torch <ver>.nvNN' (NGC build)"; return 1; }
+}
+
+test_gpu_visible_via_compose() {
+  local out
+  out=$("${COMPOSE[@]}" run --rm llm-compressor 2>&1) || { echo "$out" | tail -n 15; return 1; }
+  grep -q '^cuda available: True$' <<<"$out" || { echo "$out" | tail -n 5; echo "expected 'cuda available: True'"; return 1; }
+  grep -q '^gpu: .' <<<"$out" || { echo "expected a 'gpu: <name>' line"; return 1; }
+}
+
+test_smoke_fails_without_gpu() {
+  local out rc
+  out=$(docker run --rm --runtime=runc "llm-compressor:${LLMCOMPRESSOR_VERSION:-0.13.0}" 2>&1); rc=$?
+  echo "$out" | tail -n 5
+  [ $rc -ne 0 ] || { echo "expected non-zero exit when no GPU is exposed"; return 1; }
+  grep -q 'CUDA is not available' <<<"$out" || { echo "expected 'CUDA is not available' message"; return 1; }
+}
+
+test_models_mount_persists() {
+  local tmp target rc=0 image="llm-compressor:${LLMCOMPRESSOR_VERSION:-0.13.0}"
+  tmp=$(mktemp -d)
+  target="$tmp/not-created-yet"   # host dir does not exist beforehand
+  MODELS_DIR="$target" "${COMPOSE[@]}" run --rm llm-compressor \
+    bash -c 'echo hello > /models/probe.txt' >/dev/null 2>&1
+  if [ "$(cat "$target/probe.txt" 2>/dev/null)" != "hello" ]; then
+    echo "probe.txt did not appear in $target"; rc=1
+  fi
+  # Docker created $target as root; remove it from inside a container.
+  docker run --rm --runtime=runc -v "$tmp:/t" --entrypoint sh "$image" -c 'rm -rf /t/not-created-yet' >/dev/null 2>&1
+  rmdir "$tmp"
+  return $rc
+}
+
+# Slow tests: download a small model + calibration data and quantize it for real.
+# Opt in with SLOW=1 (needs network). TEST_MODEL overrides the model.
+check_quantize_script() {
+  local script=$1 suffix=$2 fmt=$3 calib=${4:-yes}   # calib=no for data-free scripts (no calibration flags)
+  local model=${TEST_MODEL:-Qwen/Qwen2.5-0.5B-Instruct} out rc=0 image="llm-compressor:${LLMCOMPRESSOR_VERSION:-0.13.0}"
+  local extra=()
+  [ "${SLOW:-0}" = 1 ] || { echo "skipped (set SLOW=1)"; return $SKIP_RC; }
+  [ "$calib" = yes ] && extra=(--num-samples 8 --max-seq-len 256)
+  out=$(mktemp -d)
+  "${COMPOSE[@]}" run --rm -v "$out:/out" llm-compressor \
+    python "/models/$script" "$model" --output-dir /out "${extra[@]}" 2>&1 | tail -n 5
+  local cfg="$out/${model##*/}-$suffix/config.json"
+  if [ ! -f "$cfg" ]; then echo "missing $cfg"; rc=1
+  elif ! grep -q '"quant_method": "compressed-tensors"' "$cfg"; then echo "no compressed-tensors quantization_config in $cfg"; rc=1
+  elif ! grep -q "\"format\": \"$fmt\"" "$cfg"; then echo "expected quantization format '$fmt' in $cfg"; rc=1
+  fi
+  # Container wrote as root; remove from inside a container.
+  docker run --rm --runtime=runc -v "$out:/t" --entrypoint sh "$image" -c 'rm -rf /t/* /t/.[!.]*' >/dev/null 2>&1
+  rmdir "$out"
+  return $rc
+}
+
+test_quantize_fp8_dynamic() { check_quantize_script quantize_fp8_dynamic.py FP8-Dynamic float-quantized no; }
+test_quantize_w8a8_int8()   { check_quantize_script quantize_w8a8_int8.py   W8A8-INT8 int-quantized; }
+test_quantize_w4a16_gptq()  { check_quantize_script quantize_w4a16_gptq.py  W4A16-GPTQ pack-quantized; }
+test_quantize_w4a16_awq()   { check_quantize_script quantize_w4a16_awq.py   W4A16-AWQ pack-quantized; }
+test_quantize_nvfp4()       { check_quantize_script quantize_nvfp4.py       NVFP4 nvfp4-pack-quantized; }
+
+TESTS=(test_compose_config test_image_builds test_smoke_prints_version
+       test_torch_is_ngc_build test_gpu_visible_via_compose
+       test_smoke_fails_without_gpu test_models_mount_persists
+       test_quantize_fp8_dynamic test_quantize_w8a8_int8 test_quantize_w4a16_gptq
+       test_quantize_w4a16_awq test_quantize_nvfp4)
+if [ $# -gt 0 ]; then TESTS=("$@"); fi
+for t in "${TESTS[@]}"; do run "$t"; done
+exit $FAILED

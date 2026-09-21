@@ -1,0 +1,22 @@
+services:
+  llm-compressor:
+    build:
+      context: .
+      cache_from: []
+      args:
+        LLMCOMPRESSOR_VERSION: ${LLMCOMPRESSOR_VERSION:-0.13.0}
+    image: llm-compressor:${LLMCOMPRESSOR_VERSION:-0.13.0}
+    container_name: llm-compressor
+    ipc: host
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"   # keep root-owned __pycache__ out of the ./models mount
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${HF_CACHE_DIR:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+      - ${MODELS_DIR:-./models}:/models

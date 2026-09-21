@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# quantized model output written by models/quantize_*.py
+models/output/
