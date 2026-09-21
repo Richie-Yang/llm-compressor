@@ -5,7 +5,7 @@ from llmcompressor.modifiers.quantization import GPTQModifier
 from llmcompressor.modifiers.transform import SmoothQuantModifier
 
 args = parse_args(__doc__, calibrated=True)
-model, tokenizer = load(args.model_id)
+model, tokenizer = load(args)
 
 recipe = [
     SmoothQuantModifier(smoothing_strength=0.8),

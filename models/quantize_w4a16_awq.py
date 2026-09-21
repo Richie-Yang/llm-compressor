@@ -5,7 +5,7 @@ from llmcompressor.modifiers.quantization import QuantizationModifier
 from llmcompressor.modifiers.transform import AWQModifier
 
 args = parse_args(__doc__, calibrated=True)
-model, tokenizer = load(args.model_id)
+model, tokenizer = load(args)
 
 # AWQ only rescales activation channels; QuantizationModifier does the actual W4A16 compression.
 recipe = [

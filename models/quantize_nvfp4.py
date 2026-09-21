@@ -4,7 +4,7 @@ from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 
 args = parse_args(__doc__, calibrated=True)
-model, tokenizer = load(args.model_id)
+model, tokenizer = load(args)
 
 recipe = QuantizationModifier(targets="Linear", scheme="NVFP4", ignore=args.ignore)
 oneshot(model=model, recipe=recipe, **calibration_kwargs(args))

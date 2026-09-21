@@ -113,11 +113,81 @@ test_quantize_w4a16_gptq()  { check_quantize_script quantize_w4a16_gptq.py  W4A1
 test_quantize_w4a16_awq()   { check_quantize_script quantize_w4a16_awq.py   W4A16-AWQ pack-quantized; }
 test_quantize_nvfp4()       { check_quantize_script quantize_nvfp4.py       NVFP4 nvfp4-pack-quantized; }
 
+# Offload tests (SLOW): force the disk-offload path on a tiny model with a tiny RAM budget.
+offload_run() {   # offload_run <out_dir> <script> [args...]; prints the script's combined output
+  local out=$1 script=$2; shift 2
+  "${COMPOSE[@]}" run --rm -T -v "$out:/out" llm-compressor \
+    python "/models/$script" "${TEST_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}" --output-dir /out "$@" 2>&1
+}
+root_rmdir() {    # remove a directory tree the container wrote as root
+  docker run --rm --runtime=runc -v "$1:/t" --entrypoint sh "llm-compressor:${LLMCOMPRESSOR_VERSION:-0.13.0}" \
+    -c 'rm -rf /t/* /t/.[!.]*' >/dev/null 2>&1
+  rmdir "$1"
+}
+disk_offloaded() { awk '/^offload: /{ if ($2+0 > 0) ok=1 } END{exit !ok}'; }   # "offload: <n> modules on disk, <m> in RAM"
+
+test_offload_uses_disk_and_cleans_up() {
+  [ "${SLOW:-0}" = 1 ] || { echo "skipped (set SLOW=1)"; return $SKIP_RC; }
+  local out log rc=0 model=${TEST_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
+  out=$(mktemp -d)
+  log=$(offload_run "$out" quantize_fp8_dynamic.py --offload-dir /out/offload --max-cpu-memory 500MiB --max-shard-size 300MB) || { echo "$log" | tail -n 8; rc=1; }
+  if [ $rc -eq 0 ]; then
+    disk_offloaded <<<"$log" || { echo "expected an 'offload: <n> modules on disk, ...' line with n > 0"; rc=1; }
+    grep -q '"format": "float-quantized"' "$out/${model##*/}-FP8-Dynamic/config.json" 2>/dev/null || { echo "output missing or wrong format"; rc=1; }
+    [ ! -e "$out/offload" ] || { echo "offload scratch dir was not removed"; rc=1; }
+    [ "$(ls "$out/${model##*/}-FP8-Dynamic"/*.safetensors 2>/dev/null | wc -l)" -ge 2 ] || { echo "expected several safetensors shards with --max-shard-size 300MB"; rc=1; }
+  fi
+  root_rmdir "$out"
+  return $rc
+}
+
+test_offload_matches_plain() {
+  [ "${SLOW:-0}" = 1 ] || { echo "skipped (set SLOW=1)"; return $SKIP_RC; }
+  local a b rc=0 name=${TEST_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}; name="${name##*/}-FP8-Dynamic"
+  a=$(mktemp -d); b=$(mktemp -d)
+  offload_run "$a" quantize_fp8_dynamic.py >/dev/null || { echo "plain run failed"; rc=1; }
+  offload_run "$b" quantize_fp8_dynamic.py --offload-dir /out/offload --max-cpu-memory 500MiB >/dev/null || { echo "offload run failed"; rc=1; }
+  if [ $rc -eq 0 ]; then
+    "${COMPOSE[@]}" run --rm -T -v "$a:/a:ro" -v "$b:/b:ro" -e NAME="$name" llm-compressor python - <<'EOF' 2>&1 | tail -n 3 || rc=1
+import glob, os, sys, torch
+from safetensors.torch import load_file
+def load(root):
+    t = {}
+    for f in sorted(glob.glob(f"{root}/{os.environ['NAME']}/*.safetensors")):
+        t.update(load_file(f))
+    return t
+a, b = load("/a"), load("/b")
+assert a.keys() == b.keys(), f"tensor names differ: {sorted(a.keys() ^ b.keys())[:5]}"
+raw = lambda x: x.reshape(-1).contiguous().view(torch.uint8)
+bad = [k for k in a if a[k].dtype != b[k].dtype or a[k].shape != b[k].shape or not torch.equal(raw(a[k]), raw(b[k]))]
+assert not bad, f"{len(bad)} tensors differ, e.g. {bad[:3]}"
+print(f"IDENTICAL: {len(a)} tensors")
+EOF
+  fi
+  root_rmdir "$a"; root_rmdir "$b"
+  return $rc
+}
+
+test_offload_calibrated_gptq() {
+  [ "${SLOW:-0}" = 1 ] || { echo "skipped (set SLOW=1)"; return $SKIP_RC; }
+  local out log rc=0 model=${TEST_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}
+  out=$(mktemp -d)
+  log=$(offload_run "$out" quantize_w4a16_gptq.py --num-samples 8 --max-seq-len 256 \
+        --offload-dir /out/offload --max-cpu-memory 500MiB) || { echo "$log" | tail -n 8; rc=1; }
+  if [ $rc -eq 0 ]; then
+    disk_offloaded <<<"$log" || { echo "expected 'offload: <n> modules on disk' with n > 0"; rc=1; }
+    grep -q '"format": "pack-quantized"' "$out/${model##*/}-W4A16-GPTQ/config.json" 2>/dev/null || { echo "output missing or wrong format"; rc=1; }
+  fi
+  root_rmdir "$out"
+  return $rc
+}
+
 TESTS=(test_compose_config test_image_builds test_smoke_prints_version
        test_torch_is_ngc_build test_gpu_visible_via_compose
        test_smoke_fails_without_gpu test_models_mount_persists
        test_quantize_fp8_dynamic test_quantize_w8a8_int8 test_quantize_w4a16_gptq
-       test_quantize_w4a16_awq test_quantize_nvfp4)
+       test_quantize_w4a16_awq test_quantize_nvfp4
+       test_offload_uses_disk_and_cleans_up test_offload_matches_plain test_offload_calibrated_gptq)
 if [ $# -gt 0 ]; then TESTS=("$@"); fi
 for t in "${TESTS[@]}"; do run "$t"; done
 exit $FAILED

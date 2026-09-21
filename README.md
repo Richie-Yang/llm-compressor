@@ -82,6 +82,39 @@ Sizes are relative to the BF16 original. Speed and accuracy depend on the model,
 Rule of thumb: start with FP8 Dynamic. Go to W4A16 when memory is the limit, and to NVFP4 when you need 4-bit
 speed on Blackwell and your engine supports it.
 
+### Models bigger than RAM (disk offload)
+
+A 70B model in BF16 is about 141 GB, more than this machine's 119 GB, so it cannot be loaded whole. With
+`--offload-dir` the scripts keep only a RAM budget of weights in memory and leave the rest on disk, and
+llm-compressor streams them in layer by layer. All five scripts accept these flags:
+
+| Flag                | Default            | Meaning                                                                                  |
+| ------------------- | ------------------ | ---------------------------------------------------------------------------------------- |
+| `--offload-dir`     | off                | scratch folder on disk; setting it turns offloading on; deleted when the script exits     |
+| `--max-cpu-memory`  | `24GiB`            | RAM budget for weights (whole `GiB`/`MiB`); the rest goes to disk                         |
+| `--max-shard-size`  | `5GB` if offloading | size of each saved safetensors file                                                      |
+
+```bash
+docker compose run --rm llm-compressor python /models/quantize_w4a16_gptq.py aaditya/Llama3-OpenBioLLM-70B \
+  --offload-dir /models/offload --max-cpu-memory 24GiB
+```
+
+Things to know:
+- **Unified memory:** on the GB10 the GPU and CPU share the same RAM, so keep `--max-cpu-memory` well below the
+  free memory (other containers such as the running vLLM service use a lot). The budget must be larger than the
+  biggest single layer or the embedding table.
+- **Disk:** the scratch folder holds roughly the model size minus the RAM budget (about 115 GB for a 70B at
+  24GiB), plus the output. It sits under `./models` when you use `/models/offload`. If a run is killed it can be
+  left behind as a root-owned folder; remove it with `docker run --rm -v $PWD/models:/m --entrypoint rm llm-compressor:0.13.0 -rf /m/offload`.
+- **Speed:** slow, because weights are re-read from disk for each layer. Expect hours for a 70B.
+- **Saving:** offloaded models are saved with `save_original_format=False` to work around a transformers 5.14
+  crash on sharded saves. Dense models (Llama, Qwen, ...) are unaffected and produce identical tensors (checked
+  by a test). Mixture-of-experts models may be saved in transformers 5's in-memory layout, which older readers,
+  including the vLLM image, may not understand; check before relying on it.
+- **Tested on** a 0.5B model with a tiny RAM budget (FP8 output is byte-identical to a normal run; GPTQ
+  works too). It has not been run on a 70B, so treat a first 70B run as an experiment and stop other memory-heavy
+  containers first.
+
 ## Mounts
 
 | Host (override with)                                 | Container                  | Purpose                        |
